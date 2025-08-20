@@ -1,0 +1,184 @@
+# stak
+
+Tiny, no-deps CLI to keep a stack of single-commit PR branches in sync.
+
+BASE -> b1 -> b2 -> ... -> TOP
+
+stak rebases each branch onto its parent (in order) and force-pushes with lease.
+
+⸻
+
+Why
+	•	You already have branches + PRs.
+	•	Each branch is one commit on top of the previous.
+	•	You want a single, fast command that:
+	•	validates the stack,
+	•	rebases bottom → top,
+	•	pushes updates to your remote (so PRs refresh).
+
+⸻
+
+Install
+
+# put stak on your PATH (example)
+curl -fsSL XXX > /usr/local/bin/stak
+chmod +x /usr/local/bin/stak
+
+Requirements
+	•	bash ≥ 4
+	•	git ≥ 2.20
+
+⸻
+
+## Quick start
+
+Auto-detect the stack from the top branch:
+
+```
+stak sync --top feat/audit
+```
+
+Be verbose without doing anything:
+
+```
+stak sync --top feat/audit --dry-run
+```
+
+## Terms
+	•	Remote: your Git host remote (default: origin).
+	•	Base: branch the stack sits on (auto: remote HEAD, else main|trunk|master|develop).
+	•	Stack: ordered branches; each child is exactly one commit on top of its parent.
+	•	Top: highest branch in the stack.
+
+## What stak does
+	1.	Ensures a clean working tree.
+	2.	Resolves remote and base.
+	3.	Determines the stack by walking parents from the top branch until reaching base history.
+	4.	Validates the single-commit rule at every link.
+	5.	For each branch (bottom→top):
+	•	git checkout <branch>
+	•	git rebase <parent>
+	•	git push --force-with-lease <remote> HEAD:refs/heads/<branch>
+
+If a rebase conflicts, Git stops; you fix & continue, then rerun stak sync.
+
+## Usage
+
+```
+stak sync --top <top-branch>
+          [--base <base-branch>] [--remote <name>] [--dry-run]
+          [-h|--help]
+```
+
+Options
+	•	--top <branch>: auto-detect chain by walking parents from <branch>.
+	•	--base <branch>: override base branch.
+	•	--remote <name>: remote name (default: origin).
+	•	--dry-run: print actions; make no changes.
+	•	-h|--help: show help.
+
+Exit codes
+	•	0: success
+	•	≠0: error (dirty tree, validation failed, etc.)
+
+## Assumptions (read this)
+	•	Each stack branch is exactly one commit on top of its parent.
+	•	History is linear between links (no merge commits at the tip).
+	•	Branches exist locally or on the remote.
+	•	You can force-push with lease to the remote.
+	•	stak does not create PRs or change PR metadata; your host updates PRs when branches move.
+
+
+## Examples
+
+Auto-detect chain from the top branch:
+
+```
+stak sync --top feat/audit --remote origin
+```
+
+Dry run before doing it live:
+
+```
+stak sync --top feat/audit --dry-run
+```
+
+Conflict flow:
+
+```
+stak sync --top feat/audit
+
+# Git stops on conflict
+# ... resolve files ...
+git add -A
+git rebase --continue
+# finish the rest of the stack
+stak sync --top feat/audit
+```
+
+
+## Safety
+	•	Uses --force-with-lease (won’t clobber unexpected remote changes).
+	•	Refuses to run with a dirty worktree.
+	•	Stops on conflicts; you stay in control.
+
+## FAQ
+
+Does it open PRs?
+No. It moves branches. Your PR UI updates automatically.
+
+Can a branch have multiple commits?
+No. stak enforces exactly one. Split your change or squash locally.
+
+Can PRs target their parent branch instead of main?
+Up to you. stak only rebases/pushes branches; it doesn’t touch PR bases.
+
+Multiple remotes?
+Use --remote. Default is origin.
+
+Windows?
+Use Git Bash or WSL.
+
+## Troubleshooting
+	•	“Working tree not clean”
+Commit or stash before running.
+	•	“Could not determine base branch”
+Pass --base <branch> or set the remote HEAD.
+	•	Auto-detect can’t find the next branch
+Ensure each child’s parent commit equals its parent branch’s tip, and that branch exists (locally or remote).
+	•	Validation failed: not exactly one commit
+Inspect with:
+
+git rev-list --count parent..child
+
+
+
+⸻
+
+Testing
+
+A full integration test spins up a bare remote, builds a sample stack, and checks rebases, dry-run, and validation errors.
+
+./test_gstk_integration.sh   # rename paths to 'stak' if needed
+
+
+⸻
+
+Design choices
+	•	No metadata: only Git topology.
+	•	Predictable defaults: remote HEAD → base branch.
+	•	Fast failure: strict validation before rewriting history.
+	•	Small surface: one subcommand, a few flags.
+
+⸻
+
+Contributing
+
+Issues and PRs welcome. Keep it small, POSIX-ish, and readable.
+Prefer explicit flags and clear error messages over magic.
+
+⸻
+
+License
+
+Public Domain / CC0. Use at your own risk.

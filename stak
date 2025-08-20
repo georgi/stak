@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# stak — minimal stacked-PR manager for single-commit branches
+#
+# PURPOSE
+#   Keep a stack of single-commit branches in sync, similar in spirit to
+#   ghstack/graphite, but as one simple Bash command:
+#
+#     stak sync --top <top-branch> [--base <base-branch>] [--remote <name>]
+#
+#   The stack is interpreted as: BASE -> b1 -> b2 -> ... -> top.
+#   Each branch MUST be exactly one commit ahead of its parent.
+#
+# WHAT IT DOES
+#   1) Ensures a clean working tree.
+#   2) Resolves REMOTE and BASE.
+#   3) Determines stack order (auto from --top).
+#   4) Validates one-commit invariant between links in the chain.
+#   5) Iteratively: checkout child, rebase onto parent, push --force-with-lease.
+#
+# SCOPE & NON-GOALS
+#   - Does NOT create PRs or modify titles/bodies/labels.
+#   - Does NOT “magically” recover if your branches contain multiple commits.
+#   - Stops on conflicts (fix, then re-run).
+#
+# USAGE
+#   Show help:
+#       stak --help
+#
+#   Sync by auto-detecting the chain from the top branch:
+#       stak sync --top feat/audit
+#
+#   Specify base & remote explicitly:
+#       stak sync --top feat/audit --base main --remote origin
+#
+#   Dry-run (prints actions only):
+#       stak sync --top feat/audit --dry-run
+#
+# EXIT CODES
+#   0 on success; non-zero on error (e.g., dirty tree, validation failure).
+#
+# REQUIREMENTS
+#   - bash 4+ (arrays, associative arrays)
+#   - git 2.20+ (for --force-with-lease and modern plumbing)
+#
+# SAFETY
+#   - Uses `--force-with-lease` rather than raw `--force`.
+#   - Verifies clean worktree before making changes.
+#
+# Copyright
+#   Public domain / CC0. Use at your own risk.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+###############################################################################
+# Logging & Utilities
+###############################################################################
+
+# log_info: Print a normal informational message to stdout.
+# Arguments:
+#   $*  - message parts
+log_info() { printf '==> %s\n' "$*"; }
+
+# log_warn: Print a warning to stderr.
+# Arguments:
+#   $*  - message parts
+log_warn() { printf 'warning: %s\n' "$*" >&2; }
+
+# log_err: Print an error to stderr and exit non-zero.
+# Arguments:
+#   $*  - message parts
+log_err() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# run: Execute a command or echo in dry-run mode.
+# Globals:
+#   DRYRUN (0|1)
+# Arguments:
+#   $*  - command to run
+run() {
+  if [[ "${DRYRUN:-0}" -eq 1 ]]; then
+    printf '[dry-run] %s\n' "$*"
+  else
+    eval "$@"
+  fi
+}
+
+# ensure_bin: Verify a binary exists in PATH.
+# Arguments:
+#   $1 - binary name
+ensure_bin() {
+  command -v "$1" >/dev/null 2>&1 || log_err "Required binary not found: $1"
+}
+
+# git_root: Print repository root. Exits if not in a git repo.
+git_root() {
+  git rev-parse --show-toplevel 2>/dev/null || log_err "Not a git repository."
+}
+
+###############################################################################
+# Git Helpers
+###############################################################################
+
+# ensure_clean_worktree: Fail if there are staged or unstaged changes.
+ensure_clean_worktree() {
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    log_err "Working tree not clean. Commit or stash changes first."
+  fi
+}
+
+# default_remote: Determine the default remote name.
+#   Priority:
+#     1) 'origin' if present
+#     2) first remote in `git remote`
+# Returns:
+#   prints remote name
+default_remote() {
+  if git remote | grep -qx 'origin'; then
+    echo "origin"
+    return
+  fi
+  local first
+  first="$(git remote | head -n1 || true)"
+  [[ -n "$first" ]] || log_err "No remotes found. Add one (e.g., 'origin')."
+  echo "$first"
+}
+
+# default_base_branch: Determine the default base branch.
+#   Priority:
+#     1) symbolic remote HEAD (e.g., origin/HEAD -> origin/main)
+#     2) first existing among: main, trunk, master, develop
+# Arguments:
+#   $1 - remote name
+# Returns:
+#   prints base branch name
+default_base_branch() {
+  local remote="$1" head_ref base
+  head_ref="$(git symbolic-ref -q --short "refs/remotes/${remote}/HEAD" || true)"
+  if [[ -n "$head_ref" ]]; then
+    base="${head_ref#${remote}/}"
+    echo "$base"
+    return
+  fi
+  for cand in main trunk master develop; do
+    if git ls-remote --exit-code --heads "$remote" "$cand" >/dev/null 2>&1; then
+      echo "$cand"
+      return
+    fi
+  done
+  log_err "Could not determine base branch. Specify with --base."
+}
+
+# ensure_branch_local: Ensure a local branch exists; create from remote if needed.
+# Arguments:
+#   $1 - branch name
+#   $2 - remote name
+ensure_branch_local() {
+  local b="$1" remote="$2"
+  if ! git show-ref --verify --quiet "refs/heads/$b"; then
+    if git ls-remote --heads "$remote" "$b" >/dev/null 2>&1; then
+      log_info "Creating local branch '$b' from ${remote}/${b}"
+      run "git fetch ${remote} ${b}:${b}"
+    else
+      log_err "Branch '$b' not found locally or on remote '${remote}'."
+    fi
+  fi
+}
+
+# is_ancestor: True if $1 is ancestor of $2.
+# Arguments:
+#   $1 - ancestor commit
+#   $2 - descendant commit
+is_ancestor() {
+  git merge-base --is-ancestor "$1" "$2"
+}
+
+# branch_tip: Print the commit sha of a branch tip.
+# Arguments:
+#   $1 - branch name
+branch_tip() {
+  git rev-parse "$1^{commit}"
+}
+
+# parent_of_tip: Print the parent commit sha of a branch tip (single-parent).
+# Arguments:
+#   $1 - branch name
+parent_of_tip() {
+  git rev-parse "$1^" 2>/dev/null || log_err "Branch '$1' has no parent (root commit?)."
+}
+
+# commits_ahead: Count commits in range A..B (commits in B not in A).
+# Arguments:
+#   $1 - A
+#   $2 - B
+commits_ahead() {
+  git rev-list --count "${1}..${2}"
+}
+
+###############################################################################
+# Stack Resolution
+###############################################################################
+
+# build_commit_to_branch_map: Populate an associative map of commit tip -> branch.
+# Populates:
+#   HEAD_BY_COMMIT[<sha>] = <branch-name>
+# Arguments:
+#   $1 - remote name
+# Globals:
+#   declare -gA HEAD_BY_COMMIT
+build_commit_to_branch_map() {
+  declare -gA HEAD_BY_COMMIT=()
+  # Remote heads
+  while IFS=$'\t' read -r sha ref; do
+    [[ -n "$sha" && -n "$ref" ]] || continue
+    local name="${ref#refs/heads/}"
+    HEAD_BY_COMMIT["$sha"]="$name"
+  done < <(git ls-remote --heads "$1")
+  # Local heads
+  while read -r sha ref; do
+    local name="${ref#refs/heads/}"
+    HEAD_BY_COMMIT["$sha"]="$name"
+  done < <(git for-each-ref --format='%(objectname) %(refname)' refs/heads/)
+}
+
+# auto_stack_from_top: Determine stack (bottom->top) by walking parents from top.
+#   For single-commit branches, the parent of a branch tip SHOULD be the tip
+#   of its parent branch (or an ancestor reachable from BASE). We walk:
+#     top -> parent tip -> find matching branch name -> repeat
+#   until the parent is in BASE history.
+# Arguments:
+#   $1 - top branch
+#   $2 - base branch
+#   $3 - remote name
+# Outputs:
+#   prints space-separated branch list in bottom->top order
+auto_stack_from_top() {
+  local top="$1" base="$2" remote="$3"
+  ensure_branch_local "$top" "$remote"
+  ensure_branch_local "$base" "$remote"
+
+  build_commit_to_branch_map "$remote"
+
+  local chain=("$top")
+  local cur="$top"
+
+  while true; do
+    local parent_sha
+    parent_sha="$(parent_of_tip "$cur")"
+
+    # If the parent is already contained in BASE, we reached the bottom.
+    if is_ancestor "$parent_sha" "$base"; then
+      break
+    fi
+
+    local parent_branch="${HEAD_BY_COMMIT[$parent_sha]:-}"
+    [[ -n "$parent_branch" ]] || log_err \
+      "Could not find a branch whose tip equals parent of '$cur' ($parent_sha).
+       Ensure each branch is exactly ONE commit on top of its parent and all branches exist."
+
+    chain+=("$parent_branch")
+    cur="$parent_branch"
+  done
+
+  # chain is top->...->bottom; reverse to bottom->top
+  local n=${#chain[@]} i
+  local out=()
+  for ((i=n-1; i>=0; i--)); do out+=("${chain[$i]}"); done
+
+  printf '%s\n' "${out[*]}"
+}
+
+# validate_single_commit_chain: Ensure every branch is exactly one commit ahead.
+# Arguments:
+#   $1   - base branch
+#   $@2+ - ordered branches (bottom->top)
+validate_single_commit_chain() {
+  local base="$1"; shift
+  local prev="$base"
+  local b count
+  for b in "$@"; do
+    count="$(commits_ahead "$prev" "$b")"
+    if [[ "$count" -ne 1 ]]; then
+      log_err "Validation failed: '$b' must be EXACTLY one commit ahead of its parent '$prev' (found $count)."
+    fi
+    prev="$b"
+  done
+}
+
+###############################################################################
+# Sync (Rebase & Push)
+###############################################################################
+
+# ensure_upstream_if_missing: Ensure a branch has an upstream; set or push -u.
+# Arguments:
+#   $1 - branch name
+#   $2 - remote name
+ensure_upstream_if_missing() {
+  local b="$1" remote="$2"
+  if ! git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
+    # Try to set upstream to remote/<branch>; if it doesn't exist, push -u.
+    if git ls-remote --heads "$remote" "$b" >/dev/null 2>&1; then
+      run "git branch --set-upstream-to=${remote}/${b} ${b}"
+    else
+      run "git push -u ${remote} ${b}"
+    fi
+  fi
+}
+
+# rebase_and_push_stack: For each branch, rebase onto parent and push with lease.
+# Arguments:
+#   $1   - base branch
+#   $2   - remote name
+#   $@3+ - ordered branches (bottom->top)
+rebase_and_push_stack() {
+  local base="$1" remote="$2"; shift 2
+  local prev="$base" b
+  for b in "$@"; do
+    log_info "Rebasing '${b}' onto '${prev}'"
+    run "git checkout ${b}"
+    run "git rebase ${prev}"
+
+    log_info "Pushing '${b}' to ${remote} (force-with-lease)"
+    ensure_upstream_if_missing "$b" "$remote"
+    run "git push --force-with-lease ${remote} HEAD:refs/heads/${b}"
+
+    prev="$b"
+  done
+}
+
+###############################################################################
+# CLI Parsing & Main
+###############################################################################
+
+print_help() {
+  cat <<'EOF'
+stak — minimal stacked-PR manager for single-commit branches
+
+USAGE
+  stak sync --top <top-branch> [--base <base-branch>] [--remote <name>] [--dry-run]
+
+DESCRIPTION
+  Sync (rebase & push) a stack of branches where each branch is a single commit.
+  The stack is interpreted as: BASE -> b1 -> b2 -> ... -> top.
+
+OPTIONS
+  --top <branch>        Auto-detect bottom->top chain by walking parents from <branch>.
+  --base <branch>       Base branch (defaults to remote HEAD or main/trunk/master/develop).
+  --remote <name>       Remote name (default: origin).
+  --dry-run             Print actions without executing them.
+  -h, --help            Show this help.
+
+EXAMPLES
+  stak sync --top feat/audit
+  stak sync --top feat/audit --base main --remote origin --dry-run
+EOF
+}
+
+# parse_args: Parse CLI into globals.
+# Globals set:
+#   CMD        - subcommand (currently only "sync")
+#   TOP        - top branch (optional)
+#   BASE       - base branch (optional)
+#   REMOTE     - remote name (default resolved)
+#   DRYRUN     - 0|1
+parse_args() {
+  CMD=""
+  TOP=""
+  BASE=""
+  REMOTE=""
+  DRYRUN=0
+
+  [[ $# -gt 0 ]] || { print_help; exit 0; }
+
+  case "${1:-}" in
+    sync) CMD="sync"; shift ;;
+    -h|--help) print_help; exit 0 ;;
+    *) log_err "Unknown command: ${1}. Try --help." ;;
+  esac
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --top) TOP="${2:-}"; [[ -n "$TOP" ]] || log_err "--top requires a value"; shift 2 ;;
+      --base) BASE="${2:-}"; [[ -n "$BASE" ]] || log_err "--base requires a value"; shift 2 ;;
+      --remote) REMOTE="${2:-}"; [[ -n "$REMOTE" ]] || log_err "--remote requires a value"; shift 2 ;;
+      --dry-run) DRYRUN=1; shift ;;
+      -h|--help) print_help; exit 0 ;;
+      *) log_err "Unknown option: $1" ;;
+    esac
+  done
+
+  # Required: --top
+  if [[ -z "$TOP" ]]; then
+    log_err "Missing required --top <branch>. See --help."
+  fi
+}
+
+main_sync() {
+  ensure_bin git
+  git_root >/dev/null
+  ensure_clean_worktree
+
+  local remote base
+  remote="${REMOTE:-$(default_remote)}"
+  run "git fetch ${remote} --prune"
+
+  if [[ -n "$BASE" ]]; then
+    base="$BASE"
+  else
+    base="$(default_base_branch "$remote")"
+  fi
+
+  ensure_branch_local "$base" "$remote"
+
+  local ordered=()
+  ensure_branch_local "$TOP" "$remote"
+  log_info "Auto-detecting stack from top '${TOP}' down to base '${base}'"
+  # shellcheck disable=SC2207
+  ordered=($(auto_stack_from_top "$TOP" "$base" "$remote"))
+  [[ ${#ordered[@]} -gt 0 ]] || log_err "Auto-detection produced an empty stack."
+
+  log_info "Stack order: base '${base}' -> ${ordered[*]}"
+  validate_single_commit_chain "$base" "${ordered[@]}"
+  rebase_and_push_stack "$base" "$remote" "${ordered[@]}"
+  log_info "Done."
+}
+
+main() {
+  parse_args "$@"
+  case "$CMD" in
+    sync) main_sync ;;
+    *) log_err "Unhandled command: $CMD" ;;
+  esac
+}
+
+# Trap common signals to ensure clearer exit on interruptions.
+trap 'log_warn "Interrupted."; exit 130' INT
+trap 'log_warn "Terminated."; exit 143' TERM
+
+main "$@"

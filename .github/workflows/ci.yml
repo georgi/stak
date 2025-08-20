@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: Lint and Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install shellcheck (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install shellcheck
+
+      - name: Install shfmt
+        run: |
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          go install mvdan.cc/sh/v3/cmd/shfmt@v3.10.0
+
+      - name: Make stak executable
+        run: chmod +x ./stak
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test
+
+

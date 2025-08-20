@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# test_stak_integration.sh — integration tests for stak (stacked-PR manager)
+#
+# WHAT THIS TEST DOES
+#   - Creates a temporary bare remote and a working clone.
+#   - Creates base 'main' and a 3-branch single-commit stack:
+#       main -> feat/login -> feat/2fa -> feat/audit
+#   - Verifies :
+#       (T1) Sync via --top auto-detect rebase/pushes after base changes.
+#       (T2) Sync via --top auto-detect rebase/pushes after new main change.
+#       (T3) --dry-run makes no changes.
+#       (T4) A multi-commit branch fails validation with non-zero exit.
+#
+# REQUIREMENTS
+#   - bash 4+ (associative arrays are not required here but stak needs 4+)
+#   - git 2.20+
+#   - stak available as ./stak in repo root OR on PATH
+#
+# USAGE
+#   chmod +x test_stak_integration.sh
+#   ./test_stak_integration.sh
+#
+# EXIT CODES
+#   0 on success, non-zero on any failed assertion or unexpected error.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+###############################################################################
+# Utilities / Assertions
+###############################################################################
+
+fail() { printf "ASSERTION FAILED: %s\n" "$*" >&2; exit 1; }
+info() { printf "==> %s\n" "$*" >&2; }
+
+# assert_eq EXPECT ACT MSG
+assert_eq() {
+  local expect="$1" act="$2" msg="${3:-values differ}"
+  [[ "$expect" == "$act" ]] || fail "$msg (expected '$expect', got '$act')"
+}
+
+# assert_ne EXPECT_NOT ACT MSG
+assert_ne() {
+  local not="$1" act="$2" msg="${3:-values should differ}"
+  [[ "$not" != "$act" ]] || fail "$msg (both '$act')"
+}
+
+# assert_success CMD...
+assert_success() {
+  if ! "$@"; then
+    fail "expected success: $*"
+  fi
+}
+
+# assert_failure CMD...
+# Returns success if the command fails (non-zero), and prints its output.
+assert_failure() {
+  set +e
+  local out
+  out="$("$@" 2>&1)"
+  local ec=$?
+  set -e
+  if [[ $ec -eq 0 ]]; then
+    printf "%s\n" "$out"
+    fail "expected failure (non-zero exit): $*"
+  fi
+  printf "%s\n" "$out"
+  return 0
+}
+
+# parent_of_tip BRANCH
+parent_of_tip() { git rev-parse "$1^"; }
+
+# tip_of BRANCH
+tip_of() { git rev-parse "$1^{commit}"; }
+
+# assert_parent_is PARENT_BRANCH CHILD_BRANCH
+# Ensures child's parent commit equals parent's tip commit.
+assert_parent_is() {
+  local parent="$1" child="$2"
+  local psha cparent
+  psha="$(tip_of "$parent")"
+  cparent="$(parent_of_tip "$child")"
+  assert_eq "$psha" "$cparent" "parent-of-tip mismatch: expected '$child^' == tip($parent)"
+}
+
+# assert_remote_equals_local REMOTE BRANCH
+assert_remote_equals_local() {
+  local remote="$1" branch="$2"
+  local l r
+  l="$(tip_of "$branch")"
+  r="$(git ls-remote --heads "$remote" "$branch" | awk '{print $1}')"
+  assert_eq "$l" "$r" "remote($remote/$branch) should match local tip"
+}
+
+###############################################################################
+# Repo Setup Helpers
+###############################################################################
+
+TMP_ROOT="$(mktemp -d)"
+cleanup() {
+  info "Cleaning up: $TMP_ROOT"
+  rm -rf "$TMP_ROOT"
+}
+trap cleanup EXIT
+
+REMOTE_BARE="$TMP_ROOT/remote.git"
+WORK_DIR="$TMP_ROOT/work"
+export GIT_TERMINAL_PROMPT=0
+
+# commit helper that always changes something
+mk_commit() {
+  local file="$1" msg="$2"
+  printf "%s @ %s\n" "$msg" "$(date +%s%N)" >> "$file"
+  git add "$file"
+  git commit -m "$msg"
+}
+
+# create a new single-commit child branch from PARENT
+mk_single_commit_branch() {
+  local parent="$1" child="$2" file="$3" msg="$4"
+  git checkout "$parent"
+  git switch -c "$child"
+  mk_commit "$file" "$msg"
+}
+
+# push branch if not on remote
+push_branch() {
+  local b="$1"
+  git push -u origin "$b"
+}
+
+###############################################################################
+# Resolve stak binary (prefer local ./stak, fallback to PATH)
+###############################################################################
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# If local stak exists but isn't executable, try to make it executable
+if [[ -f "$ROOT_DIR/stak" && ! -x "$ROOT_DIR/stak" ]]; then
+  chmod +x "$ROOT_DIR/stak" || true
+fi
+if [[ -x "$ROOT_DIR/stak" ]]; then
+  STAK_BIN="$ROOT_DIR/stak"
+elif command -v stak >/dev/null 2>&1; then
+  STAK_BIN="$(command -v stak)"
+else
+  echo "stak binary not found. Ensure './stak' exists or stak is on PATH." >&2
+  exit 1
+fi
+info "Using stak at $STAK_BIN"
+
+###############################################################################
+# Create bare remote and clone
+###############################################################################
+info "Setting up bare remote and working clone"
+git init --bare "$REMOTE_BARE" >/dev/null
+
+git clone "$REMOTE_BARE" "$WORK_DIR" >/dev/null
+cd "$WORK_DIR"
+
+git config user.name "stak-integration"
+git config user.email "stak@example.local"
+git config init.defaultBranch main
+
+# Base: main
+git switch -c main >/dev/null
+echo "# demo" > README.md
+git add README.md
+git commit -m "init main" >/dev/null
+git push -u origin main >/dev/null
+
+# Build stack: feat/login -> feat/2fa -> feat/audit
+mk_single_commit_branch main       feat/login app.txt  "login: add login feature"
+push_branch feat/login
+
+mk_single_commit_branch feat/login feat/2fa  app.txt  "2fa: add two-factor"
+push_branch feat/2fa
+
+mk_single_commit_branch feat/2fa   feat/audit app.txt "audit: add audit log"
+push_branch feat/audit
+
+###############################################################################
+# TEST 1: --top auto-detect sync after base changes
+###############################################################################
+info "TEST 1: --top auto-detect sync rebases after base changes"
+# Advance base (main) to force a rebase requirement
+git checkout main >/dev/null
+mk_commit README.md "chore: advance main"
+git push origin main >/dev/null
+
+# Record old SHAs (before sync)
+OLD_LOGIN="$(tip_of feat/login)"
+OLD_2FA="$(tip_of feat/2fa)"
+OLD_AUDIT="$(tip_of feat/audit)"
+
+# Run stak with auto-detection from top
+assert_success "$STAK_BIN" sync --top feat/audit --base main --remote origin
+
+# After sync, each child's parent should equal parent's new tip
+assert_parent_is main       feat/login
+assert_parent_is feat/login feat/2fa
+assert_parent_is feat/2fa   feat/audit
+
+# Tips must have changed (rebased) relative to their old SHAs
+assert_ne "$OLD_LOGIN" "$(tip_of feat/login)" "feat/login tip should change after rebase"
+assert_ne "$OLD_2FA"   "$(tip_of feat/2fa)"   "feat/2fa tip should change after rebase"
+assert_ne "$OLD_AUDIT" "$(tip_of feat/audit)" "feat/audit tip should change after rebase"
+
+# Remote updated
+assert_remote_equals_local "$REMOTE_BARE" feat/login
+assert_remote_equals_local "$REMOTE_BARE" feat/2fa
+assert_remote_equals_local "$REMOTE_BARE" feat/audit
+
+###############################################################################
+# TEST 2: --top auto-detect after another base change
+###############################################################################
+info "TEST 2: --top auto-detect chain and sync"
+git checkout main >/dev/null
+mk_commit README.md "chore: advance main again"
+git push origin main >/dev/null
+
+# Run stak with auto-detection from top
+assert_success "$STAK_BIN" sync --top feat/audit --base main --remote origin
+
+# Validate parent relationships again (against newest tips)
+assert_parent_is main       feat/login
+assert_parent_is feat/login feat/2fa
+assert_parent_is feat/2fa   feat/audit
+
+# Remote updated again
+assert_remote_equals_local "$REMOTE_BARE" feat/login
+assert_remote_equals_local "$REMOTE_BARE" feat/2fa
+assert_remote_equals_local "$REMOTE_BARE" feat/audit
+
+###############################################################################
+# TEST 3: --dry-run should not change SHAs
+###############################################################################
+info "TEST 3: dry-run causes no changes"
+# Advance base but use dry-run: branch tips must remain unchanged afterwards.
+git checkout main >/dev/null
+mk_commit README.md "chore: advance main (dry-run test)"
+git push origin main >/dev/null
+
+PRE_LOGIN="$(tip_of feat/login)"
+PRE_2FA="$(tip_of feat/2fa)"
+PRE_AUDIT="$(tip_of feat/audit)"
+
+assert_success "$STAK_BIN" sync --top feat/audit --base main --remote origin --dry-run
+
+POST_LOGIN="$(tip_of feat/login)"
+POST_2FA="$(tip_of feat/2fa)"
+POST_AUDIT="$(tip_of feat/audit)"
+
+assert_eq "$PRE_LOGIN" "$POST_LOGIN" "dry-run should not change feat/login"
+assert_eq "$PRE_2FA"   "$POST_2FA"   "dry-run should not change feat/2fa"
+assert_eq "$PRE_AUDIT" "$POST_AUDIT" "dry-run should not change feat/audit"
+
+###############################################################################
+# TEST 4: validation failure on multi-commit child
+###############################################################################
+info "TEST 4: multi-commit branch should fail validation"
+
+# Make a new invalid branch with TWO commits on top of feat/login
+git checkout feat/login >/dev/null
+git switch -c feat/invalid >/dev/null
+mk_commit app.txt "invalid: part 1"
+mk_commit app.txt "invalid: part 2"
+git push -u origin feat/invalid >/dev/null
+
+# Expect stak to fail validation when syncing from top invalid branch
+OUT="$(assert_failure "$STAK_BIN" sync --top feat/invalid --base main --remote origin)"
+# The error message should mention EXACTLY one commit
+echo "$OUT" | grep -qi "EXACTLY one commit" || fail "expected validation message to mention EXACTLY one commit"
+
+info "All tests passed."
