@@ -21,7 +21,7 @@ stak rebases each branch onto its parent (in order) and force-pushes with lease.
 
 ```bash
 # put stak on your PATH (example)
-curl -fsSL XXX > /usr/local/bin/stak
+curl -fsSL https://raw.githubusercontent.com/georgi/stak/refs/heads/main/stak > /usr/local/bin/stak
 chmod +x /usr/local/bin/stak
 ```
 
