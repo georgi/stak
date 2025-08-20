@@ -44,6 +44,42 @@ Be verbose without doing anything:
 stak sync --top feat/audit --dry-run
 ```
 
+## Normal workflow
+
+After you change a file on any branch in the stack:
+
+1) Amend the branch's single commit (keep one-commit invariant):
+
+```bash
+git add -A
+git commit --amend --no-edit
+```
+
+2) Update the whole stack on the remote so PRs refresh:
+
+- If auto-detection can walk the chain from the top:
+
+```bash
+stak sync --top <TOP_BRANCH>
+```
+
+- If you already pushed updated parents (e.g., A and B) and need to rebase children (C, D) onto them, explicitly restack:
+
+```bash
+stak restack --branches A,B,C,D --base <BASE> --remote origin
+```
+
+3) If a conflict occurs, resolve and continue, then rerun the same command:
+
+```bash
+git add -A
+git rebase --continue
+# then
+stak sync --top <TOP_BRANCH>
+# or
+stak restack --branches A,B,C,D --base <BASE>
+```
+
 ## Terms
 
 - Remote: your Git host remote (default: origin).
@@ -62,6 +98,8 @@ stak sync --top feat/audit --dry-run
    - `git rebase <parent>`
    - `git push --force-with-lease <remote> HEAD:refs/heads/<branch>`
 
+You can skip auto-detection by providing an explicit branch list via `restack`.
+
 If a rebase conflicts, Git stops; you fix & continue, then rerun `stak sync`.
 
 ## Usage
@@ -70,6 +108,10 @@ If a rebase conflicts, Git stops; you fix & continue, then rerun `stak sync`.
 stak sync --top <top-branch>
           [--base <base-branch>] [--remote <name>] [--dry-run]
           [-h|--help]
+
+stak restack --branches <b1,b2,...>
+             [--base <base-branch>] [--remote <name>] [--dry-run]
+             [-h|--help]
 ```
 
 ### Options
@@ -78,6 +120,7 @@ stak sync --top <top-branch>
 - `--base <branch>`: override base branch.
 - `--remote <name>`: remote name (default: `origin`).
 - `--dry-run`: print actions; make no changes.
+- `--branches <csv>`: for `restack`, explicit chain in bottom→top order (e.g., `A,B,C,D`).
 - `-h|--help`: show help.
 
 ### Exit codes
@@ -105,6 +148,12 @@ Dry run before doing it live:
 
 ```bash
 stak sync --top feat/audit --dry-run
+```
+
+Restack when parents were updated and children need to be rebased onto them:
+
+```bash
+stak restack --branches A,B,C,D --base main --remote origin
 ```
 
 Conflict flow:
@@ -172,7 +221,7 @@ A full integration test spins up a bare remote, builds a sample stack, and check
 - No metadata: only Git topology.
 - Predictable defaults: remote HEAD → base branch.
 - Fast failure: strict validation before rewriting history.
-- Small surface: one subcommand, a few flags.
+- Small surface: two subcommands (`sync`, `restack`) with a few flags.
 
 
 ## License

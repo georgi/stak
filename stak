@@ -336,6 +336,7 @@ stak — minimal stacked-PR manager for single-commit branches
 
 USAGE
   stak sync --top <top-branch> [--base <base-branch>] [--remote <name>] [--dry-run]
+  stak restack --branches <b1,b2,...> [--base <base-branch>] [--remote <name>] [--dry-run]
 
 DESCRIPTION
   Sync (rebase & push) a stack of branches where each branch is a single commit.
@@ -346,11 +347,13 @@ OPTIONS
   --base <branch>       Base branch (defaults to remote HEAD or main/trunk/master/develop).
   --remote <name>       Remote name (default: origin).
   --dry-run             Print actions without executing them.
+  --branches <csv>      For 'restack': explicit chain in bottom->top order (e.g., A,B,C,D).
   -h, --help            Show this help.
 
 EXAMPLES
   stak sync --top feat/audit
   stak sync --top feat/audit --base main --remote origin --dry-run
+  stak restack --branches A,B,C,D --base main --remote origin
 EOF
 }
 
@@ -367,11 +370,13 @@ parse_args() {
   BASE=""
   REMOTE=""
   DRYRUN=0
+  BRANCHES_CSV=""
 
   [[ $# -gt 0 ]] || { print_help; exit 0; }
 
   case "${1:-}" in
     sync) CMD="sync"; shift ;;
+    restack) CMD="restack"; shift ;;
     -h|--help) print_help; exit 0 ;;
     *) log_err "Unknown command: ${1}. Try --help." ;;
   esac
@@ -382,6 +387,7 @@ parse_args() {
       --base) BASE="${2:-}"; [[ -n "$BASE" ]] || log_err "--base requires a value"; shift 2 ;;
       --remote) REMOTE="${2:-}"; [[ -n "$REMOTE" ]] || log_err "--remote requires a value"; shift 2 ;;
       --dry-run) DRYRUN=1; shift ;;
+      --branches) BRANCHES_CSV="${2:-}"; [[ -n "$BRANCHES_CSV" ]] || log_err "--branches requires a comma-separated list"; shift 2 ;;
       -h|--help) print_help; exit 0 ;;
       *) log_err "Unknown option: $1" ;;
     esac
@@ -389,7 +395,9 @@ parse_args() {
 
   # Required: --top
   if [[ -z "$TOP" ]]; then
-    log_err "Missing required --top <branch>. See --help."
+    if [[ "$CMD" != "restack" ]]; then
+      log_err "Missing required --top <branch>. See --help."
+    fi
   fi
 }
 
@@ -423,10 +431,49 @@ main_sync() {
   log_info "Done."
 }
 
+main_restack() {
+  ensure_bin git
+  git_root >/dev/null
+  ensure_clean_worktree
+
+  local remote base
+  remote="${REMOTE:-$(default_remote)}"
+  run "git fetch ${remote} --prune"
+
+  if [[ -n "$BASE" ]]; then
+    base="$BASE"
+  else
+    base="$(default_base_branch "$remote")"
+  fi
+
+  ensure_branch_local "$base" "$remote"
+
+  [[ -n "$BRANCHES_CSV" ]] || log_err "restack requires --branches <b1,b2,...> in bottom->top order"
+
+  # Split CSV into array, trimming whitespace
+  local csv_no_space
+  csv_no_space="${BRANCHES_CSV//[[:space:]]/}"
+  IFS=',' read -r -a ORDERED_BRANCHES <<< "$csv_no_space"
+
+  [[ ${#ORDERED_BRANCHES[@]} -gt 0 ]] || log_err "No branches provided to --branches"
+
+  # Ensure each branch exists locally (or fetch from remote)
+  local b
+  for b in "${ORDERED_BRANCHES[@]}"; do
+    [[ -n "$b" ]] || continue
+    ensure_branch_local "$b" "$remote"
+  done
+
+  log_info "Restacking explicit chain: base '${base}' -> ${ORDERED_BRANCHES[*]}"
+  rebase_and_push_stack "$base" "$remote" "${ORDERED_BRANCHES[@]}"
+  log_info "Done."
+}
+
 main() {
   parse_args "$@"
   case "$CMD" in
     sync) main_sync ;;
+    restack) main_restack ;;
     *) log_err "Unhandled command: $CMD" ;;
   esac
 }
