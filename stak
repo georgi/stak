@@ -97,6 +97,111 @@ git_root() {
 }
 
 ###############################################################################
+# State Management (for resumable rebases)
+###############################################################################
+
+# State file format (.git/stak-state)
+# -----------------------------------
+# This file records stack configuration and, when a rebase halts, progress.
+# It is a simple, line-based KEY=VALUE file with no quoting or escaping.
+# Unknown keys are ignored for forward-compatibility.
+#
+# Keys:
+#   BASE      : Base branch name
+#   REMOTE    : Remote name
+#   ORDERED   : Comma-separated list of branches in bottom->top order
+#   INDEX     : Zero-based index into ORDERED of the branch currently being rebased
+#   CURRENT   : Convenience copy of ORDERED[INDEX]
+#   DRYRUN    : 0|1 flag recorded for information only; does not affect behavior on resume
+#
+# Lifecycles:
+#   - Persistent stack (written after successful sync/restack):
+#       BASE, REMOTE, ORDERED
+#   - In-progress rebase (written when a rebase stops on conflicts):
+#       BASE, REMOTE, ORDERED, INDEX, CURRENT, DRYRUN
+#
+# Removal:
+#   - The file is removed by clear_state() and after a successful 'stak continue'.
+#
+# state_file: Return path to the stak state file inside .git/
+state_file() {
+  git rev-parse --git-path stak-state
+}
+
+# save_state: Persist current progress for resumable workflow.
+# Arguments:
+#   $1 - base branch
+#   $2 - remote name
+#   $3 - ordered branches as CSV (bottom->top)
+#   $4 - current index (0-based) in ORDERED
+#   $5 - current branch name (ORDERED[$4])
+# save_state: Persist in-progress rebase state (includes progress markers).
+# Arguments:
+#   $1 base, $2 remote, $3 ordered_csv, $4 index (0-based), $5 current branch
+save_state() {
+  local base="$1" remote="$2" ordered_csv="$3" index="$4" current="$5"
+  local f
+  f="$(state_file)"
+  {
+    printf 'BASE=%s\n' "$base"
+    printf 'REMOTE=%s\n' "$remote"
+    printf 'ORDERED=%s\n' "$ordered_csv"
+    printf 'INDEX=%s\n' "$index"
+    printf 'CURRENT=%s\n' "$current"
+    printf 'DRYRUN=%s\n' "${DRYRUN:-0}"
+  } >"$f"
+}
+
+# load_state: Source state into environment. Fails if missing.
+load_state() {
+  local f key val line
+  f="$(state_file)"
+  [[ -f "$f" ]] || log_err "No stak state found. Nothing to continue."
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip empty or comment lines
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    case "$key" in
+      BASE)       BASE="$val" ;;
+      REMOTE)     REMOTE="$val" ;;
+      ORDERED)    ORDERED="$val" ;;
+      INDEX)      INDEX="$val" ;;
+      CURRENT)    CURRENT="$val" ;;
+      DRYRUN)     DRYRUN="$val" ;;
+      *) ;; # ignore unknown keys
+    esac
+  done < "$f"
+}
+
+# clear_state: Remove state file if present.
+clear_state() {
+  local f
+  f="$(state_file)"
+  [[ -f "$f" ]] && rm -f "$f" || true
+}
+
+# rebase_in_progress: Return 0 if a git rebase is currently in progress.
+rebase_in_progress() {
+  local m a
+  m="$(git rev-parse --git-path rebase-merge)"
+  a="$(git rev-parse --git-path rebase-apply)"
+  [[ -d "$m" || -d "$a" ]]
+}
+
+# write_stack_state: Persist only stable stack info (no progress fields).
+# Arguments: $1 base, $2 remote, $3 ordered_csv
+write_stack_state() {
+  local base="$1" remote="$2" ordered_csv="$3" f
+  f="$(state_file)"
+  {
+    printf 'BASE=%s\n' "$base"
+    printf 'REMOTE=%s\n' "$remote"
+    printf 'ORDERED=%s\n' "$ordered_csv"
+  } >"$f"
+}
+
+###############################################################################
 # Git Helpers
 ###############################################################################
 
@@ -312,11 +417,47 @@ ensure_upstream_if_missing() {
 #   $@3+ - ordered branches (bottom->top)
 rebase_and_push_stack() {
   local base="$1" remote="$2"; shift 2
-  local prev="$base" b
-  for b in "$@"; do
-    log_info "Rebasing '${b}' onto '${prev}'"
+  local branches=("$@")
+  local prev="$base" b idx ordered_csv seq_editor
+
+  # Default sequence editor is a no-op when interactive is requested unless user overrides
+  seq_editor="${GIT_SEQUENCE_EDITOR:-:}"
+
+  # Compute CSV for state persistence
+  ordered_csv="$(IFS=,; echo "${branches[*]}")"
+
+  for idx in "${!branches[@]}"; do
+    b="${branches[$idx]}"
+    if [[ "${INTERACTIVE:-0}" -eq 1 ]]; then
+      log_info "Rebasing '${b}' onto '${prev}' (interactive)"
+    else
+      log_info "Rebasing '${b}' onto '${prev}'"
+    fi
     run "git checkout ${b}"
-    run "git rebase ${prev}"
+    if [[ "${DRYRUN:-0}" -eq 1 ]]; then
+      if [[ "${INTERACTIVE:-0}" -eq 1 ]]; then
+        printf '[dry-run] GIT_EDITOR=%q GIT_SEQUENCE_EDITOR=%q git rebase -i %s\n' ":" "$seq_editor" "$prev"
+      else
+        printf '[dry-run] GIT_EDITOR=%q git rebase %s\n' ":" "$prev"
+      fi
+    else
+      if [[ "${INTERACTIVE:-0}" -eq 1 ]]; then
+        if ! GIT_EDITOR=:\
+ GIT_SEQUENCE_EDITOR="$seq_editor" git rebase -i "$prev"; then
+          save_state "$base" "$remote" "$ordered_csv" "$idx" "$b"
+          log_warn "Rebase stopped due to conflicts on '${b}'."
+          log_warn "Resolve conflicts, then run: stak continue"
+          exit 2
+        fi
+      else
+        if ! GIT_EDITOR=: git rebase "$prev"; then
+          save_state "$base" "$remote" "$ordered_csv" "$idx" "$b"
+          log_warn "Rebase stopped due to conflicts on '${b}'."
+          log_warn "Resolve conflicts, then run: stak continue"
+          exit 2
+        fi
+      fi
+    fi
 
     log_info "Pushing '${b}' to ${remote} (force-with-lease)"
     ensure_upstream_if_missing "$b" "$remote"
@@ -337,6 +478,7 @@ stak — minimal stacked-PR manager for single-commit branches
 USAGE
   stak sync --top <top-branch> [--base <base-branch>] [--remote <name>] [--dry-run]
   stak restack --branches <b1,b2,...> [--base <base-branch>] [--remote <name>] [--dry-run]
+  stak continue
 
 DESCRIPTION
   Sync (rebase & push) a stack of branches where each branch is a single commit.
@@ -347,6 +489,7 @@ OPTIONS
   --base <branch>       Base branch (defaults to remote HEAD or main/trunk/master/develop).
   --remote <name>       Remote name (default: origin).
   --dry-run             Print actions without executing them.
+  --interactive         Use interactive rebase (`git rebase -i`).
   --branches <csv>      For 'restack': explicit chain in bottom->top order (e.g., A,B,C,D).
   -h, --help            Show this help.
 
@@ -354,6 +497,7 @@ EXAMPLES
   stak sync --top feat/audit
   stak sync --top feat/audit --base main --remote origin --dry-run
   stak restack --branches A,B,C,D --base main --remote origin
+  stak continue   # after resolving conflicts, resume and finish the stack
 EOF
 }
 
@@ -371,12 +515,14 @@ parse_args() {
   REMOTE=""
   DRYRUN=0
   BRANCHES_CSV=""
+  INTERACTIVE=0
 
   [[ $# -gt 0 ]] || { print_help; exit 0; }
 
   case "${1:-}" in
     sync) CMD="sync"; shift ;;
     restack) CMD="restack"; shift ;;
+    continue) CMD="continue"; shift ;;
     -h|--help) print_help; exit 0 ;;
     *) log_err "Unknown command: ${1}. Try --help." ;;
   esac
@@ -387,17 +533,16 @@ parse_args() {
       --base) BASE="${2:-}"; [[ -n "$BASE" ]] || log_err "--base requires a value"; shift 2 ;;
       --remote) REMOTE="${2:-}"; [[ -n "$REMOTE" ]] || log_err "--remote requires a value"; shift 2 ;;
       --dry-run) DRYRUN=1; shift ;;
+      --interactive) INTERACTIVE=1; shift ;;
       --branches) BRANCHES_CSV="${2:-}"; [[ -n "$BRANCHES_CSV" ]] || log_err "--branches requires a comma-separated list"; shift 2 ;;
       -h|--help) print_help; exit 0 ;;
       *) log_err "Unknown option: $1" ;;
     esac
   done
 
-  # Required: --top
-  if [[ -z "$TOP" ]]; then
-    if [[ "$CMD" != "restack" ]]; then
-      log_err "Missing required --top <branch>. See --help."
-    fi
+  # Required: --top only for 'sync'
+  if [[ "$CMD" == "sync" && -z "$TOP" ]]; then
+    log_err "Missing required --top <branch>. See --help."
   fi
 }
 
@@ -419,15 +564,34 @@ main_sync() {
   ensure_branch_local "$base" "$remote"
 
   local ordered=()
-  ensure_branch_local "$TOP" "$remote"
-  log_info "Auto-detecting stack from top '${TOP}' down to base '${base}'"
-  # shellcheck disable=SC2207
-  ordered=($(auto_stack_from_top "$TOP" "$base" "$remote"))
-  [[ ${#ordered[@]} -gt 0 ]] || log_err "Auto-detection produced an empty stack."
+  if [[ -n "${TOP:-}" ]]; then
+    ensure_branch_local "$TOP" "$remote"
+    log_info "Auto-detecting stack from top '${TOP}' down to base '${base}'"
+    # shellcheck disable=SC2207
+    ordered=($(auto_stack_from_top "$TOP" "$base" "$remote"))
+    [[ ${#ordered[@]} -gt 0 ]] || log_err "Auto-detection produced an empty stack."
+  else
+    # Try to load saved ORDERED from state file
+    if [[ -f "$(state_file)" ]]; then
+      load_state
+      if [[ -n "${ORDERED:-}" ]]; then
+        IFS=',' read -r -a ordered <<< "$ORDERED"
+        log_info "Using saved stack from state: base '${BASE:-$base}' -> ${ordered[*]}"
+        # If state had a different base/remote, prefer explicit CLI, else state
+        [[ -n "${BASE:-}" ]] && base="$BASE"
+        [[ -n "${REMOTE:-}" ]] && remote="$REMOTE"
+      fi
+    fi
+    [[ ${#ordered[@]} -gt 0 ]] || log_err "No --top provided and no saved stack in state."
+  fi
 
   log_info "Stack order: base '${base}' -> ${ordered[*]}"
   validate_single_commit_chain "$base" "${ordered[@]}"
   rebase_and_push_stack "$base" "$remote" "${ordered[@]}"
+  # Save persistent stack info for future runs
+  local ordered_csv
+  ordered_csv="$(IFS=,; echo "${ordered[*]}")"
+  write_stack_state "$base" "$remote" "$ordered_csv"
   log_info "Done."
 }
 
@@ -469,11 +633,73 @@ main_restack() {
   log_info "Done."
 }
 
+main_continue() {
+  ensure_bin git
+  git_root >/dev/null
+
+  # Load state
+  load_state
+
+  # Expect variables from state: BASE, REMOTE, ORDERED, INDEX, CURRENT, DRYRUN
+  local base remote ordered_csv index current seq_editor prev branches=()
+  base="$BASE"
+  remote="$REMOTE"
+  ordered_csv="$ORDERED"
+  index="$INDEX"
+  current="$CURRENT"
+
+  # Reconstruct branches array
+  IFS=',' read -r -a branches <<< "$ordered_csv"
+
+  # Determine previous branch (parent) for current index
+  if [[ "$index" -eq 0 ]]; then
+    prev="$base"
+  else
+    prev="${branches[$((index-1))]}"
+  fi
+
+  # Resume rebase
+  if [[ "${DRYRUN:-0}" -eq 1 ]]; then
+    printf '[dry-run] GIT_EDITOR=%q git rebase --continue\n' ":"
+  else
+    if rebase_in_progress; then
+      if ! GIT_EDITOR=: git rebase --continue; then
+        log_warn "Rebase still conflicted. Resolve conflicts, then run: stak continue"
+        exit 2
+      fi
+    else
+      # If no rebase in progress (user may have already continued), ensure up-to-date
+      log_warn "No rebase in progress. Continuing with remaining branches."
+    fi
+  fi
+
+  # After successful rebase of CURRENT, push and continue remaining ones
+  log_info "Pushing '${current}' to ${remote} (force-with-lease)"
+  run "git checkout ${current}"
+  ensure_upstream_if_missing "$current" "$remote"
+  run "git push --force-with-lease ${remote} HEAD:refs/heads/${current}"
+
+  # Continue with rest of branches after current index
+  local next_index=$((index+1))
+  if [[ ${#branches[@]} -gt $next_index ]]; then
+    local rest=("${branches[@]:$next_index}")
+    # Reuse the same interactive mode with default sequence editor.
+    # IMPORTANT: subsequent branches must rebase onto the just-resolved 'current',
+    # not onto the original 'base'.
+    rebase_and_push_stack "$current" "$remote" "${rest[@]}"
+  fi
+
+  # Clear state on success
+  clear_state
+  log_info "Done."
+}
+
 main() {
   parse_args "$@"
   case "$CMD" in
     sync) main_sync ;;
     restack) main_restack ;;
+    continue) main_continue ;;
     *) log_err "Unhandled command: $CMD" ;;
   esac
 }

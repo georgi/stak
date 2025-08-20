@@ -44,6 +44,45 @@ Be verbose without doing anything:
 stak sync --top feat/audit --dry-run
 ```
 
+## Interactive mode and resume
+
+- Optional interactive mode: pass `--interactive` to use `git rebase -i`.
+- When interactive is enabled, `GIT_SEQUENCE_EDITOR` defaults to a no-op (`:`) unless you set one.
+- To edit the todo list interactively, set an editor, for example:
+
+```bash
+GIT_SEQUENCE_EDITOR="${EDITOR:-vi}" stak sync --top <TOP_BRANCH>
+# or configure once
+git config --global sequence.editor "code --wait"
+```
+
+### Conflicts and `stak continue`
+
+If a rebase stops due to conflicts, stak records progress in `.git/stak-state`, prints next steps, and exits. Resolve files, stage changes, then run:
+
+```bash
+git add -A
+stak continue
+```
+
+`stak continue` executes `git rebase --continue`, pushes the resolved branch with `--force-with-lease`, and proceeds with the remaining branches in the stack. Repeat if further conflicts appear.
+
+### Saved stack state
+
+After a successful `sync`/`restack`, stak writes the stack information to `.git/stak-state` (base, remote, ordered branches). On the next run, you can omit `--top` and stak will reuse the saved stack:
+
+```bash
+# once:
+stak sync --top feat/audit
+
+# later, no need to pass --top:
+stak sync
+```
+
+Notes:
+- Passing `--top/--base/--remote` overrides saved values.
+- The state file also stores progress during conflicts; `stak continue` uses it to resume.
+
 ## Normal workflow
 
 After you change a file on any branch in the stack:
@@ -69,15 +108,11 @@ stak sync --top <TOP_BRANCH>
 stak restack --branches A,B,C,D --base <BASE> --remote origin
 ```
 
-3) If a conflict occurs, resolve and continue, then rerun the same command:
+3) If a conflict occurs, resolve and continue with `stak continue`:
 
 ```bash
 git add -A
-git rebase --continue
-# then
-stak sync --top <TOP_BRANCH>
-# or
-stak restack --branches A,B,C,D --base <BASE>
+stak continue
 ```
 
 ## Terms
@@ -95,8 +130,13 @@ stak restack --branches A,B,C,D --base <BASE>
 4. Validates the single-commit rule at every link.
 5. For each branch (bottom → top):
    - `git checkout <branch>`
-   - `git rebase <parent>`
+   - `git rebase -i <parent>`
    - `git push --force-with-lease <remote> HEAD:refs/heads/<branch>`
+
+Interactive behavior:
+- Only enabled when `--interactive` is provided.
+- Default `GIT_SEQUENCE_EDITOR` is `:` (no-op) unless you set your own.
+- On conflicts, stak saves state and instructs you to run `stak continue` after resolving.
 
 You can skip auto-detection by providing an explicit branch list via `restack`.
 
@@ -112,6 +152,9 @@ stak sync --top <top-branch>
 stak restack --branches <b1,b2,...>
              [--base <base-branch>] [--remote <name>] [--dry-run]
              [-h|--help]
+
+stak continue
+  [-h|--help]
 ```
 
 ### Options
@@ -164,9 +207,7 @@ stak sync --top feat/audit
 # Git stops on conflict
 # ... resolve files ...
 git add -A
-git rebase --continue
-# finish the rest of the stack
-stak sync --top feat/audit
+stak continue
 ```
 
 ## Safety
