@@ -6,7 +6,7 @@ Tiny, no-deps CLI to keep a stack of single-commit PR branches in sync.
 BASE -> b1 -> b2 -> ... -> TOP
 ```
 
-stak rebases each branch onto its parent (in order) and force-pushes with lease.
+stak cherry-picks each branch's single commit onto its parent (in order) and force-pushes with lease.
 
 ## Why
 
@@ -14,8 +14,25 @@ stak rebases each branch onto its parent (in order) and force-pushes with lease.
 - Each branch is one commit on top of the previous.
 - You want a single, fast command that:
   - validates the stack,
-  - rebases bottom → top,
+  - cherry-picks bottom → top,
   - pushes updates to your remote (so PRs refresh).
+
+## How it works
+
+At a high level, stak keeps a chain of single-commit feature branches rebased onto each other by recreating each tip with a cherry-pick:
+
+- Stack model: `BASE -> b1 -> b2 -> ... -> TOP`, where each `bN` is exactly one commit on top of its parent.
+- Auto-detection: given `--top`, stak walks parent commits from `TOP` downward until it reaches a commit contained in `BASE`. It maps commit tips to branch names across local and remote heads to reconstruct the chain bottom→top.
+- Validation: before changing anything, stak checks that every link has exactly one commit ahead using `git rev-list --count parent..child`.
+- Sync algorithm (bottom→top): for each branch `b` with parent `p`:
+  - `git checkout b`
+  - if `parent_of_tip(b) == tip(p)`, skip (already up-to-date)
+  - `git reset --hard p`
+  - `git cherry-pick <original tip of b>` (recreates `b` on top of `p`)
+  - `git push --force-with-lease origin HEAD:refs/heads/b`
+- Conflicts & resume: if a cherry-pick stops, stak writes progress to `.git/stak-state` and exits with instructions. `stak continue` runs `git cherry-pick --continue` (or `git rebase --continue` if applicable) and proceeds with the remaining branches.
+- Safety: requires a clean worktree, prints `--dry-run` plans without changing anything, and always uses `--force-with-lease`.
+- Scope: stak moves branches only. It does not open PRs or change their metadata.
 
 ## Install
 
@@ -44,28 +61,18 @@ Be verbose without doing anything:
 stak sync --top feat/audit --dry-run
 ```
 
-## Interactive mode and resume
-
-- Optional interactive mode: pass `--interactive` to use `git rebase -i`.
-- When interactive is enabled, `GIT_SEQUENCE_EDITOR` defaults to a no-op (`:`) unless you set one.
-- To edit the todo list interactively, set an editor, for example:
-
-```bash
-GIT_SEQUENCE_EDITOR="${EDITOR:-vi}" stak sync --top <TOP_BRANCH>
-# or configure once
-git config --global sequence.editor "code --wait"
-```
+## Resume after conflicts
 
 ### Conflicts and `stak continue`
 
-If a rebase stops due to conflicts, stak records progress in `.git/stak-state`, prints next steps, and exits. Resolve files, stage changes, then run:
+If a cherry-pick stops due to conflicts, stak records progress in `.git/stak-state`, prints next steps, and exits. Resolve files, stage changes, then run:
 
 ```bash
 git add -A
 stak continue
 ```
 
-`stak continue` executes `git rebase --continue`, pushes the resolved branch with `--force-with-lease`, and proceeds with the remaining branches in the stack. Repeat if further conflicts appear.
+`stak continue` executes `git cherry-pick --continue` (falls back to `git rebase --continue` if applicable), pushes the resolved branch with `--force-with-lease`, and proceeds with the remaining branches in the stack. Repeat if further conflicts appear.
 
 ### Saved stack state
 
@@ -103,6 +110,8 @@ stak sync --top <TOP_BRANCH>
 ```
 
 - If you already pushed updated parents (e.g., A and B) and need to rebase children (C, D) onto them, explicitly restack:
+  
+  # Note: with cherry-pick semantics this is still called "restack"
 
 ```bash
 stak restack --branches A,B,C,D --base <BASE> --remote origin
@@ -130,17 +139,15 @@ stak continue
 4. Validates the single-commit rule at every link.
 5. For each branch (bottom → top):
    - `git checkout <branch>`
-   - `git rebase -i <parent>`
+   - `git reset --hard <parent>`
+   - `git cherry-pick <branch@{tip}>`
    - `git push --force-with-lease <remote> HEAD:refs/heads/<branch>`
 
-Interactive behavior:
-- Only enabled when `--interactive` is provided.
-- Default `GIT_SEQUENCE_EDITOR` is `:` (no-op) unless you set your own.
-- On conflicts, stak saves state and instructs you to run `stak continue` after resolving.
+On conflicts, stak saves state and instructs you to run `stak continue` after resolving.
 
 You can skip auto-detection by providing an explicit branch list via `restack`.
 
-If a rebase conflicts, Git stops; you fix & continue, then rerun `stak sync`.
+If a cherry-pick conflicts, Git stops; you fix & continue, then rerun `stak sync`.
 
 ## Usage
 
@@ -193,7 +200,7 @@ Dry run before doing it live:
 stak sync --top feat/audit --dry-run
 ```
 
-Restack when parents were updated and children need to be rebased onto them:
+Restack when parents were updated and children need to be restacked onto them:
 
 ```bash
 stak restack --branches A,B,C,D --base main --remote origin
@@ -228,7 +235,7 @@ No. stak enforces exactly one. Split your change or squash locally.
 
 **Can PRs target their parent branch instead of main?**
 
-Up to you. stak only rebases/pushes branches; it doesn’t touch PR bases.
+Up to you. stak only moves/pushes branches; it doesn’t touch PR bases.
 
 **Multiple remotes?**
 
@@ -251,7 +258,7 @@ git rev-list --count parent..child
 
 ## Testing
 
-A full integration test spins up a bare remote, builds a sample stack, and checks rebases, dry-run, and validation errors.
+A full integration test spins up a bare remote, builds a sample stack, and checks cherry-pick syncs, dry-run, and validation errors.
 
 ```bash
 ./test

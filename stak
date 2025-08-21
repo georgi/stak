@@ -15,7 +15,7 @@
 #   2) Resolves REMOTE and BASE.
 #   3) Determines stack order (auto from --top).
 #   4) Validates one-commit invariant between links in the chain.
-#   5) Iteratively: checkout child, rebase onto parent, push --force-with-lease.
+#   5) Iteratively: checkout child, cherry-pick tip onto parent, push --force-with-lease.
 #
 # SCOPE & NON-GOALS
 #   - Does NOT create PRs or modify titles/bodies/labels.
@@ -84,6 +84,16 @@ run() {
   fi
 }
 
+# print_conflicted_files: Print a short list of currently conflicted paths, if any.
+print_conflicted_files() {
+  local files
+  files="$(git diff --name-only --diff-filter=U || true)"
+  if [[ -n "$files" ]]; then
+    log_warn "Conflicted files:"
+    printf '%s\n' "$files" >&2
+  fi
+}
+
 # ensure_bin: Verify a binary exists in PATH.
 # Arguments:
 #   $1 - binary name
@@ -97,12 +107,12 @@ git_root() {
 }
 
 ###############################################################################
-# State Management (for resumable rebases)
+# State Management (for resumable cherry-picks)
 ###############################################################################
 
 # State file format (.git/stak-state)
 # -----------------------------------
-# This file records stack configuration and, when a rebase halts, progress.
+# This file records stack configuration and, when a cherry-pick halts, progress.
 # It is a simple, line-based KEY=VALUE file with no quoting or escaping.
 # Unknown keys are ignored for forward-compatibility.
 #
@@ -117,7 +127,7 @@ git_root() {
 # Lifecycles:
 #   - Persistent stack (written after successful sync/restack):
 #       BASE, REMOTE, ORDERED
-#   - In-progress rebase (written when a rebase stops on conflicts):
+#   - In-progress cherry-pick (written when a cherry-pick stops on conflicts):
 #       BASE, REMOTE, ORDERED, INDEX, CURRENT, DRYRUN
 #
 # Removal:
@@ -187,6 +197,14 @@ rebase_in_progress() {
   m="$(git rev-parse --git-path rebase-merge)"
   a="$(git rev-parse --git-path rebase-apply)"
   [[ -d "$m" || -d "$a" ]]
+}
+
+# cherry_pick_in_progress: Return 0 if a git cherry-pick is currently in progress.
+cherry_pick_in_progress() {
+  local head sequencer
+  head="$(git rev-parse --git-path CHERRY_PICK_HEAD)"
+  sequencer="$(git rev-parse --git-path sequencer)"
+  [[ -f "$head" || -d "$sequencer" ]]
 }
 
 # write_stack_state: Persist only stable stack info (no progress fields).
@@ -410,7 +428,7 @@ ensure_upstream_if_missing() {
   fi
 }
 
-# rebase_and_push_stack: For each branch, rebase onto parent and push with lease.
+# rebase_and_push_stack: For each branch, cherry-pick tip onto parent and push with lease.
 # Arguments:
 #   $1   - base branch
 #   $2   - remote name
@@ -418,44 +436,45 @@ ensure_upstream_if_missing() {
 rebase_and_push_stack() {
   local base="$1" remote="$2"; shift 2
   local branches=("$@")
-  local prev="$base" b idx ordered_csv seq_editor
-
-  # Default sequence editor is a no-op when interactive is requested unless user overrides
-  seq_editor="${GIT_SEQUENCE_EDITOR:-:}"
+  local prev="$base" b idx ordered_csv tip
 
   # Compute CSV for state persistence
   ordered_csv="$(IFS=,; echo "${branches[*]}")"
 
   for idx in "${!branches[@]}"; do
     b="${branches[$idx]}"
-    if [[ "${INTERACTIVE:-0}" -eq 1 ]]; then
-      log_info "Rebasing '${b}' onto '${prev}' (interactive)"
-    else
-      log_info "Rebasing '${b}' onto '${prev}'"
-    fi
     run "git checkout ${b}"
+    tip="$(branch_tip "$b")"
+    # If already based on prev, skip
+    local current_parent prev_sha
+    current_parent="$(parent_of_tip "$b")"
+    prev_sha="$(branch_tip "$prev")"
+    if [[ "$current_parent" == "$prev_sha" ]]; then
+      log_info "'${b}' already based on '${prev}'. Skipping."
+      log_info "Pushing '${b}' to ${remote} (force-with-lease)"
+      ensure_upstream_if_missing "$b" "$remote"
+      run "git push --force-with-lease ${remote} HEAD:refs/heads/${b}"
+      prev="$b"
+      continue
+    fi
+
+    log_info "Cherry-picking tip of '${b}' onto '${prev}'"
     if [[ "${DRYRUN:-0}" -eq 1 ]]; then
-      if [[ "${INTERACTIVE:-0}" -eq 1 ]]; then
-        printf '[dry-run] GIT_EDITOR=%q GIT_SEQUENCE_EDITOR=%q git rebase -i %s\n' ":" "$seq_editor" "$prev"
-      else
-        printf '[dry-run] GIT_EDITOR=%q git rebase %s\n' ":" "$prev"
-      fi
+      printf '[dry-run] git reset --hard %s\n' "$prev"
+      printf '[dry-run] git cherry-pick %s\n' "$tip"
     else
-      if [[ "${INTERACTIVE:-0}" -eq 1 ]]; then
-        if ! GIT_EDITOR=:\
- GIT_SEQUENCE_EDITOR="$seq_editor" git rebase -i "$prev"; then
-          save_state "$base" "$remote" "$ordered_csv" "$idx" "$b"
-          log_warn "Rebase stopped due to conflicts on '${b}'."
-          log_warn "Resolve conflicts, then run: stak continue"
-          exit 2
-        fi
-      else
-        if ! GIT_EDITOR=: git rebase "$prev"; then
-          save_state "$base" "$remote" "$ordered_csv" "$idx" "$b"
-          log_warn "Rebase stopped due to conflicts on '${b}'."
-          log_warn "Resolve conflicts, then run: stak continue"
-          exit 2
-        fi
+      if ! git reset --hard "$prev"; then
+        save_state "$base" "$remote" "$ordered_csv" "$idx" "$b"
+        log_warn "Failed to reset '${b}' to '${prev}'. Resolve issues, then run: stak continue"
+        print_conflicted_files
+        exit 2
+      fi
+      if ! git cherry-pick "$tip"; then
+        save_state "$base" "$remote" "$ordered_csv" "$idx" "$b"
+        log_warn "Cherry-pick stopped due to conflicts on '${b}'."
+        log_warn "Resolve conflicts, then run: stak continue"
+        print_conflicted_files
+        exit 2
       fi
     fi
 
@@ -481,7 +500,7 @@ USAGE
   stak continue
 
 DESCRIPTION
-  Sync (rebase & push) a stack of branches where each branch is a single commit.
+  Sync (cherry-pick & push) a stack of branches where each branch is a single commit.
   The stack is interpreted as: BASE -> b1 -> b2 -> ... -> top.
 
 OPTIONS
@@ -489,7 +508,7 @@ OPTIONS
   --base <branch>       Base branch (defaults to remote HEAD or main/trunk/master/develop).
   --remote <name>       Remote name (default: origin).
   --dry-run             Print actions without executing them.
-  --interactive         Use interactive rebase (`git rebase -i`).
+  # interactive mode is not applicable for cherry-pick; option is accepted but ignored.
   --branches <csv>      For 'restack': explicit chain in bottom->top order (e.g., A,B,C,D).
   -h, --help            Show this help.
 
@@ -658,18 +677,25 @@ main_continue() {
     prev="${branches[$((index-1))]}"
   fi
 
-  # Resume rebase
+  # Resume cherry-pick or legacy rebase
   if [[ "${DRYRUN:-0}" -eq 1 ]]; then
-    printf '[dry-run] GIT_EDITOR=%q git rebase --continue\n' ":"
+    printf '[dry-run] git cherry-pick --continue || git rebase --continue\n'
   else
-    if rebase_in_progress; then
-      if ! GIT_EDITOR=: git rebase --continue; then
+    if cherry_pick_in_progress; then
+      if ! git cherry-pick --continue; then
+        log_warn "Cherry-pick still conflicted. Resolve conflicts, then run: stak continue"
+        print_conflicted_files
+        exit 2
+      fi
+    elif rebase_in_progress; then
+      if ! git rebase --continue; then
         log_warn "Rebase still conflicted. Resolve conflicts, then run: stak continue"
+        print_conflicted_files
         exit 2
       fi
     else
-      # If no rebase in progress (user may have already continued), ensure up-to-date
-      log_warn "No rebase in progress. Continuing with remaining branches."
+      # If no operation in progress (user may have already continued), proceed
+      log_warn "No cherry-pick or rebase in progress. Continuing with remaining branches."
     fi
   fi
 
